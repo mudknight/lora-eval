@@ -460,9 +460,16 @@ def build_similarity_graph(images_and_labels, out_path):
     ]
 
     # Short labels for every epoch; the x-axis label for delta i shows
-    # the left epoch of each pair, e.g. "8" for the 8->9 transition
+    # the left epoch of each pair, e.g. "8" for the 8->9 transition.
+    # If the last epoch is unlabeled ("final"), we override the rightmost
+    # label with the inferred next number (max numbered epoch + 1) so
+    # the final epoch shows up on the x-axis aligned with its data point.
     short_labels = [_epoch_label(lbl) for lbl in labels]
     x_labels = short_labels[:-1]
+    if x_labels and short_labels and short_labels[-1] == "final":
+        numbered = [int(s) for s in short_labels if s.isdigit()]
+        if numbered:
+            x_labels[-1] = str(max(numbered) + 1)
 
     # --- Layout constants ---
     width = max(800, 120 * len(deltas))
