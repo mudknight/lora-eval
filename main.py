@@ -4,8 +4,9 @@ main.py - Evaluate Stable Diffusion LoRAs via the ComfyUI API.
 
 For each .safetensors file found in the target directory, injects LoRA
 syntax (and optional trigger words) into a ComfyUI workflow, queues
-generation, saves individual images, and produces a composite grid
-showing all epochs side-by-side with labels.
+generation for each configured prompt, saves individual images, and
+produces a composite grid (one row per prompt, one column per epoch)
+and a similarity graph based on the first prompt.
 """
 
 import argparse
@@ -36,8 +37,6 @@ def load_config(config_path):
 
     required = [
         "comfyui_url",
-        "positive_prompt",
-        "negative_prompt",
         "workflow_file",
         "positive_node_id",
         "positive_text_field",
@@ -47,6 +46,33 @@ def load_config(config_path):
     for key in required:
         if key not in config:
             raise ValueError(f"Config missing required key: '{key}'")
+
+    # Support both old single-prompt format and new multi-prompt format.
+    # Old: positive_prompt (str) + negative_prompt (str)
+    # New: prompts (list of {label, positive}) + negative_prompt (str)
+    if "prompts" not in config and "positive_prompt" not in config:
+        raise ValueError(
+            "Config must have either 'prompts' or 'positive_prompt'."
+        )
+    # negative_prompt is optional at the top level if every prompt
+    # defines its own negative field
+    if "negative_prompt" not in config:
+        for p in config["prompts"]:
+            if "negative" not in p:
+                raise ValueError(
+                    "Each prompt must have a 'negative' field when "
+                    "top-level 'negative_prompt' is not set."
+                )
+
+    # Normalise to the multi-prompt format internally
+    if "prompts" not in config:
+        config["prompts"] = [
+            {
+                "label": "default",
+                "positive": config["positive_prompt"],
+                "negative": config["negative_prompt"],
+            }
+        ]
 
     return config
 
@@ -65,13 +91,9 @@ def _lora_sort_key(path):
     """
     Sort key that places epoch-numbered files in numeric order and puts
     any unnumbered file (the final merged epoch) last.
-
-    e.g. model-000001, model-000002, ..., model  (no number -> last)
     """
     stem = os.path.splitext(os.path.basename(path))[0]
     match = re.search(r'(\d+)$', stem)
-    # Numbered files sort by their integer value; unnumbered files sort
-    # after all numbered ones by using float('inf')
     return (0, int(match.group(1))) if match else (1, 0)
 
 
@@ -112,9 +134,6 @@ def lora_syntax(safetensors_path, weight, trigger_words):
 def inject_prompts(workflow, config, positive_text, negative_text):
     """
     Return a deep copy of *workflow* with positive/negative text injected.
-
-    Node IDs and field names come from the config so this works with any
-    workflow that exposes its prompt nodes.
     """
     wf = copy.deepcopy(workflow)
 
@@ -218,20 +237,23 @@ def collect_images(api_url, history_entry):
 # Image saving
 # ---------------------------------------------------------------------------
 
-def image_path_for_lora(out_dir, lora_path):
-    """Return the expected .png path for a given LoRA file."""
+def image_path_for_lora(out_dir, lora_path, prompt_index=0):
+    """
+    Return the output .png path for a LoRA/prompt combination.
+
+    The first prompt (index 0) uses the plain stem so LoRA Manager can
+    find it by swapping the .safetensors extension. Additional prompts
+    get a suffix, e.g. stem_p1.png, stem_p2.png.
+    """
     stem = os.path.splitext(os.path.basename(lora_path))[0]
-    return os.path.join(out_dir, f"{stem}.png")
+    if prompt_index == 0:
+        return os.path.join(out_dir, f"{stem}.png")
+    return os.path.join(out_dir, f"{stem}_p{prompt_index}.png")
 
 
-def save_individual(image, out_dir, lora_path):
-    """
-    Save a single PIL image alongside the .safetensors file.
-
-    Filename matches the LoRA stem so tools like LoRA Manager can locate
-    the preview by swapping the extension on the .safetensors filename.
-    """
-    dest = image_path_for_lora(out_dir, lora_path)
+def save_individual(image, out_dir, lora_path, prompt_index=0):
+    """Save a PIL image for the given LoRA and prompt index."""
+    dest = image_path_for_lora(out_dir, lora_path, prompt_index)
     image.save(dest)
     return dest
 
@@ -254,7 +276,7 @@ def write_metadata(lora_path, image_path, overwrite=False):
 
     On first run the full template is written. On subsequent runs only
     ``preview_url`` is updated so user edits are not clobbered,
-    unless *overwrite* is True, in which case the file is recreated.
+    unless *overwrite* is True.
     """
     stem = os.path.splitext(os.path.basename(lora_path))[0]
     meta_path = os.path.join(
@@ -262,7 +284,6 @@ def write_metadata(lora_path, image_path, overwrite=False):
     )
 
     if os.path.exists(meta_path) and not overwrite:
-        # File already exists — update preview_url only
         with open(meta_path, "r", encoding="utf-8") as fh:
             meta = json.load(fh)
         meta["preview_url"] = image_path
@@ -310,10 +331,7 @@ def write_metadata(lora_path, image_path, overwrite=False):
 # ---------------------------------------------------------------------------
 
 def _get_font(size):
-    """
-    Try to load a TTF font; fall back to the PIL default if unavailable.
-    """
-    # Common font locations across Linux / macOS / Windows
+    """Try to load a TTF font; fall back to the PIL default."""
     candidates = [
         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -336,11 +354,7 @@ def _get_font(size):
 # ---------------------------------------------------------------------------
 
 def _truncate_label(label, font, max_width):
-    """
-    Truncate *label* with an ellipsis if it exceeds *max_width* pixels.
-
-    Keeps the font size fixed so the bar height always matches the text.
-    """
+    """Truncate *label* with an ellipsis if it exceeds *max_width* px."""
     def text_width(t):
         try:
             bb = font.getbbox(t)
@@ -357,64 +371,108 @@ def _truncate_label(label, font, max_width):
     return "…"
 
 
-def build_composite(images_and_labels, out_path):
+def build_composite(rows, out_path):
     """
-    Build and save a horizontal composite of *images_and_labels*.
+    Build and save a multi-row composite image.
 
-    Each entry is a (PIL.Image, str) tuple. A text label is drawn above
-    each image. Font size and label bar height scale with the image height
-    so labels are legible at any output resolution. All images are assumed
-    to be the same size; if not they are resized to match the first.
+    *rows* is a list of rows, where each row is a list of
+    (PIL.Image, label_str) tuples representing one epoch.
+    All rows must have the same number of columns.
+
+    Layout:
+    - Column headers (epoch labels) drawn once across the top.
+    - Row label drawn as a left-side sidebar for each prompt row.
+    - Images fill the grid cells.
     """
-    if not images_and_labels:
+    if not rows or not rows[0]:
         return
 
-    base_w, base_h = images_and_labels[0][0].size
+    n_cols = len(rows[0])
+    n_rows = len(rows)
 
-    # Font size: 6% of image height, label bar is font + equal padding.
-    # Both scale together so the text always fills the bar.
+    base_w, base_h = rows[0][0][0].size
+
+    # Font and label bar scale with image height
     font_size = int(base_h * 0.06)
-    label_height = int(font_size * 2.0)
+    col_header_h = int(font_size * 2.0)
     font = _get_font(font_size)
 
-    total_w = base_w * len(images_and_labels)
-    total_h = base_h + label_height
+    # Row label sidebar — narrower than a full image column
+    row_label_w = int(base_w * 0.28)
+    row_label_font_size = max(16, int(base_h * 0.04))
+    row_label_font = _get_font(row_label_font_size)
+
+    total_w = row_label_w + base_w * n_cols
+    total_h = col_header_h + base_h * n_rows
 
     composite = Image.new("RGB", (total_w, total_h), color=(30, 30, 30))
     draw = ImageDraw.Draw(composite)
 
-    for idx, (img, label) in enumerate(images_and_labels):
-        # Resize if necessary
-        if img.size != (base_w, base_h):
-            img = img.resize((base_w, base_h), Image.LANCZOS)
-
-        x_offset = idx * base_w
-
-        # Draw label background strip
+    # Column headers — epoch labels from the first row
+    for col_idx, (_, label) in enumerate(rows[0]):
+        x0 = row_label_w + col_idx * base_w
         draw.rectangle(
-            [x_offset, 0, x_offset + base_w, label_height],
+            [x0, 0, x0 + base_w, col_header_h],
             fill=(50, 50, 50),
         )
-
         label = _truncate_label(label, font, base_w)
-
         try:
-            bbox = font.getbbox(label)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
+            bb = font.getbbox(label)
+            tw, th = bb[2] - bb[0], bb[3] - bb[1]
         except AttributeError:
-            text_w, text_h = draw.textsize(label, font=font)
+            tw, th = draw.textsize(label, font=font)
+        draw.text(
+            (x0 + (base_w - tw) // 2, (col_header_h - th) // 2),
+            label,
+            fill=(220, 220, 220),
+            font=font,
+        )
 
-        # Centre text horizontally and vertically in the label bar
-        text_x = x_offset + (base_w - text_w) // 2
-        text_y = (label_height - text_h) // 2
-        draw.text((text_x, text_y), label, fill=(220, 220, 220), font=font)
+    # Rows
+    for row_idx, row in enumerate(rows):
+        y0 = col_header_h + row_idx * base_h
 
-        # Paste the image below the label strip
-        composite.paste(img, (x_offset, label_height))
+        # Row label sidebar
+        draw.rectangle(
+            [0, y0, row_label_w, y0 + base_h],
+            fill=(40, 40, 40),
+        )
+        # Use the prompt label stored on the row (passed as row_label)
+        row_label = getattr(row, "label", "")
+        row_label = _truncate_label(row_label, row_label_font, row_label_w)
+        try:
+            bb = row_label_font.getbbox(row_label)
+            rw, rh = bb[2] - bb[0], bb[3] - bb[1]
+        except AttributeError:
+            rw, rh = draw.textsize(row_label, font=row_label_font)
+        draw.text(
+            (
+                (row_label_w - rw) // 2,
+                y0 + (base_h - rh) // 2,
+            ),
+            row_label,
+            fill=(180, 180, 180),
+            font=row_label_font,
+        )
+
+        # Images
+        for col_idx, (img, _) in enumerate(row):
+            if img.size != (base_w, base_h):
+                img = img.resize((base_w, base_h), Image.LANCZOS)
+            composite.paste(
+                img, (row_label_w + col_idx * base_w, y0)
+            )
 
     composite.save(out_path)
     return out_path
+
+
+class LabelledRow(list):
+    """A list subclass that carries a prompt label for build_composite."""
+
+    def __init__(self, label, items):
+        super().__init__(items)
+        self.label = label
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +505,7 @@ def _deltas_histogram(imgs):
     """
     def hist(img):
         grey = img.convert("L")
-        h = grey.histogram()          # 256 ints summing to pixel count
+        h = grey.histogram()
         total = sum(h)
         return [v / total for v in h]
 
@@ -463,8 +521,7 @@ def _deltas_pixel(imgs):
     Epoch-to-epoch mean absolute pixel difference, normalised to 0-1.
 
     Resizes all images to match the first, converts to greyscale, then
-    computes the average per-pixel absolute difference. The raw value
-    is in [0, 255], so we divide by 255.
+    computes the average per-pixel absolute difference normalised by 255.
     """
     base_size = imgs[0].size
 
@@ -504,11 +561,9 @@ _SERIES_STYLES = {
 
 def _epoch_label(full_label):
     """
-    Extract a short epoch label from a full label string.
+    Extract a short epoch label from a full composite label string.
 
-    Pulls the trailing numeric portion from the stem and strips leading
-    zeros, e.g. "mymodel-000008 (1.0)" -> "8". Files with no trailing
-    number (the final merged epoch) are labelled "final".
+    e.g. "mymodel-000008 (1.0)" -> "8", "mymodel (1.0)" -> "final".
     """
     stem = re.sub(r'\s*\(.*\)$', '', full_label).strip()
     match = re.search(r'(\d+)$', stem)
@@ -521,8 +576,9 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
     """
     Build and save a line graph of epoch-to-epoch image similarity.
 
-    *methods* is a tuple of method names from METHODS. All selected
-    series are plotted on the same normalised 0-1 y-axis with a legend.
+    Uses only the first prompt's images since that is the style prompt.
+    *methods* is a tuple of names from METHODS; all series share the
+    same normalised 0-1 y-axis.
     """
     if len(images_and_labels) < 2:
         print("  Skipping similarity graph: need at least 2 images.")
@@ -530,14 +586,10 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
 
     imgs, labels = zip(*images_and_labels)
 
-    # Short labels for x-axis. Each label is the right-hand epoch of
-    # each consecutive pair, so the last label is always the final epoch.
     short_labels = [_epoch_label(lbl) for lbl in labels]
     x_labels = short_labels[1:]
-
     n_deltas = len(imgs) - 1
 
-    # Compute deltas for each requested method
     series = {}
     for method in methods:
         print(f"  Computing {method} similarity…")
@@ -547,7 +599,7 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
     width = max(800, 120 * n_deltas)
     height = 500
     pad_left = 70
-    pad_right = 120   # extra room for legend
+    pad_right = 120
     pad_top = 40
     pad_bottom = 60
 
@@ -560,7 +612,6 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
     font_small = _get_font(max(14, height // 30))
     font_label = _get_font(max(12, height // 36))
 
-    # Y axis: normalised 0-1
     y_max = 1.0
 
     def to_xy(idx, val):
@@ -572,7 +623,6 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
         y = pad_top + plot_h - int(val / y_max * plot_h)
         return x, y
 
-    # Grid lines at 0, 0.25, 0.5, 0.75, 1.0
     for grid_val in [0.0, 0.25, 0.5, 0.75, 1.0]:
         gy = pad_top + plot_h - int(grid_val / y_max * plot_h)
         draw.line(
@@ -587,16 +637,14 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
             anchor="rm",
         )
 
-    # Plot each series
     dot_r = max(4, height // 80)
     for method, deltas in series.items():
-        line_col, dot_col, legend_lbl = _SERIES_STYLES[method]
+        line_col, dot_col, _ = _SERIES_STYLES[method]
         points = [to_xy(i, d) for i, d in enumerate(deltas)]
 
         for i in range(len(points) - 1):
             draw.line(
-                [points[i], points[i + 1]],
-                fill=line_col, width=2,
+                [points[i], points[i + 1]], fill=line_col, width=2,
             )
 
         for i, (px, py) in enumerate(points):
@@ -604,8 +652,6 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
                 [(px - dot_r, py - dot_r), (px + dot_r, py + dot_r)],
                 fill=dot_col,
             )
-            # Only annotate values when a single method is shown to
-            # avoid cluttering multi-series graphs
             if len(series) == 1:
                 draw.text(
                     (px, py - dot_r - 6),
@@ -615,7 +661,6 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
                     anchor="mb",
                 )
 
-    # X-axis labels
     for i in range(n_deltas):
         px, _ = to_xy(i, 0)
         draw.text(
@@ -626,12 +671,10 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
             anchor="mt",
         )
 
-    # Legend (top-right inside the pad_right margin)
     legend_x = pad_left + plot_w + 10
     legend_y = pad_top
     for method in methods:
-        line_col, dot_col, legend_lbl = _SERIES_STYLES[method]
-        # Colour swatch
+        line_col, _, legend_lbl = _SERIES_STYLES[method]
         draw.rectangle(
             [legend_x, legend_y, legend_x + 16, legend_y + 14],
             fill=line_col,
@@ -644,7 +687,6 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
         )
         legend_y += 24
 
-    # Chart title
     draw.text(
         (pad_left + plot_w // 2, 12),
         "Epoch-to-epoch similarity (higher = more change)",
@@ -666,11 +708,10 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
              overwrite_json=False, methods=("phash",)):
     """Run the full evaluation pipeline for all LoRAs in *lora_dir*."""
     api_url = config["comfyui_url"]
-    base_positive = config["positive_prompt"]
-    base_negative = config["negative_prompt"]
+    prompts = config["prompts"]
+    global_negative = config.get("negative_prompt", "")
     lora_weight = config.get("lora_weight", 1.0)
     trigger_words = config.get("trigger_words", "")
-    images_per_lora = config.get("images_per_lora", 1)
 
     workflow_path = config["workflow_file"]
     workflow = load_workflow(workflow_path)
@@ -681,75 +722,87 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
         return
 
     print(f"Found {len(loras)} LoRA(s) in {lora_dir}")
+    print(f"Running {len(prompts)} prompt(s) per LoRA")
 
-    # Each entry: (PIL.Image, label_str) for the composite and graph
-    composite_entries = []
+    # composite_rows[prompt_index] = LabelledRow of (img, epoch_label)
+    composite_rows = [
+        LabelledRow(p["label"], []) for p in prompts
+    ]
+
+    # first_prompt_entries used for the similarity graph
+    first_prompt_entries = []
 
     for lora_path in loras:
         syntax = lora_syntax(lora_path, lora_weight, trigger_words)
-        positive = f"{base_positive}, {syntax}"
-        negative = base_negative
+        stem = os.path.splitext(os.path.basename(lora_path))[0]
+        epoch_label = f"{stem} ({lora_weight})"
 
         print(f"\nProcessing: {os.path.basename(lora_path)}")
-        print(f"  Positive: {positive}")
 
         if dry_run:
             print("  [dry-run] Skipping API call.")
             continue
 
-        dest = image_path_for_lora(lora_dir, lora_path)
-        stem = os.path.splitext(os.path.basename(lora_path))[0]
-        label = f"{stem} ({lora_weight})"
+        for p_idx, prompt_cfg in enumerate(prompts):
+            positive = f"{prompt_cfg['positive']}, {syntax}"
+            # Per-prompt negative takes priority over the global one
+            negative = prompt_cfg.get("negative", global_negative)
+            print(f"  Prompt [{prompt_cfg['label']}]: {positive}")
 
-        # If the image already exists and overwrite_images is off, reuse
-        # it for the composite without hitting the API at all.
-        if os.path.exists(dest) and not overwrite_images:
-            print(f"  Skipping: {os.path.basename(dest)} already exists.")
-            write_metadata(lora_path, dest, overwrite=overwrite_json)
-            composite_entries.append((Image.open(dest).copy(), label))
-            continue
+            dest = image_path_for_lora(lora_dir, lora_path, p_idx)
 
-        wf = inject_prompts(workflow, config, positive, negative)
-        client_id = str(uuid.uuid4())
+            if os.path.exists(dest) and not overwrite_images:
+                print(
+                    f"  Skipping: {os.path.basename(dest)} already exists."
+                )
+                img = Image.open(dest).copy()
+            else:
+                wf = inject_prompts(workflow, config, positive, negative)
+                client_id = str(uuid.uuid4())
+                prompt_id = queue_prompt(api_url, wf, client_id)
+                print(f"  Queued prompt {prompt_id}")
 
-        images = []
-        for img_index in range(images_per_lora):
-            prompt_id = queue_prompt(api_url, wf, client_id)
-            print(f"  Queued prompt {prompt_id} (image {img_index + 1})")
+                history = wait_for_prompt(api_url, prompt_id)
+                images = collect_images(api_url, history)
 
-            history = wait_for_prompt(api_url, prompt_id)
-            batch = collect_images(api_url, history)
+                if not images:
+                    print("  Warning: no images returned.")
+                    continue
 
-            if not batch:
-                print("  Warning: no images returned for this prompt.")
-                continue
+                img = images[0]
+                saved = save_individual(img, lora_dir, lora_path, p_idx)
+                print(f"  Saved: {saved}")
 
-            images.extend(batch)
+            # Write metadata pointing at the first prompt's image only
+            if p_idx == 0:
+                write_metadata(
+                    lora_path, dest, overwrite=overwrite_json
+                )
 
-        if not images:
-            continue
+            composite_rows[p_idx].append((img, epoch_label))
 
-        saved = save_individual(images[0], lora_dir, lora_path)
-        print(f"  Saved: {saved}")
-        write_metadata(lora_path, saved, overwrite=overwrite_json)
+        # Track first prompt image for similarity graph
+        if composite_rows[0]:
+            first_prompt_entries.append(composite_rows[0][-1])
 
-        composite_entries.append((images[0], label))
-
-    if composite_entries and not dry_run:
+    if any(composite_rows) and not dry_run:
         composite_path = os.path.join(lora_dir, "_composite.png")
         if overwrite_composite or not os.path.exists(composite_path):
-            build_composite(composite_entries, composite_path)
+            build_composite(composite_rows, composite_path)
             print(f"\nComposite saved: {composite_path}")
         else:
-            print(f"\nSkipping composite (already exists, use -oc to regen)")
+            print(
+                "\nSkipping composite (already exists, use -oc to regen)"
+            )
 
         graph_path = os.path.join(lora_dir, "_similarity.png")
         if overwrite_graph or not os.path.exists(graph_path):
-            build_similarity_graph(composite_entries, graph_path,
-                                   methods=methods)
+            build_similarity_graph(
+                first_prompt_entries, graph_path, methods=methods
+            )
             print(f"Similarity graph saved: {graph_path}")
         else:
-            print(f"Skipping graph (already exists, use -og to regen)")
+            print("Skipping graph (already exists, use -og to regen)")
 
 
 # ---------------------------------------------------------------------------
@@ -775,8 +828,6 @@ def parse_args():
         action="store_true",
         help="Validate config and list LoRAs without calling the API.",
     )
-
-    # Granular overwrite flags
     parser.add_argument(
         "-oi", "--overwrite-images",
         action="store_true",
@@ -804,8 +855,7 @@ def parse_args():
         default=["phash"],
         metavar="METHOD",
         help=(
-            "Similarity method(s) to plot: phash, histogram, pixel, all."
-            " Multiple values are plotted as separate series."
+            "Similarity method(s): phash, histogram, pixel, all."
             " (default: phash)"
         ),
     )
@@ -833,10 +883,7 @@ def main():
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # -o is shorthand for all four overwrite flags
     overwrite_all = args.overwrite
-
-    # Expand "all" to every method
     methods = list(METHODS) if "all" in args.method else args.method
 
     evaluate(
