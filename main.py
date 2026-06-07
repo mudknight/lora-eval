@@ -418,6 +418,87 @@ def build_composite(images_and_labels, out_path):
 
 
 # ---------------------------------------------------------------------------
+# Similarity metrics
+# ---------------------------------------------------------------------------
+
+METHODS = ("phash", "histogram", "pixel")
+
+
+def _deltas_phash(imgs):
+    """
+    Epoch-to-epoch Hamming distance between pHash digests, normalised
+    to 0-1 (max distance for a 64-bit pHash is 64).
+    """
+    hashes = [imagehash.phash(img) for img in imgs]
+    return [
+        (hashes[i] - hashes[i + 1]) / 64.0
+        for i in range(len(hashes) - 1)
+    ]
+
+
+def _deltas_histogram(imgs):
+    """
+    Epoch-to-epoch histogram difference, normalised to 0-1.
+
+    Converts each image to greyscale, builds a 256-bin histogram,
+    normalises it to a probability distribution, then computes the
+    L1 distance between consecutive pairs. L1 on normalised histograms
+    is bounded [0, 2], so we divide by 2.
+    """
+    def hist(img):
+        grey = img.convert("L")
+        h = grey.histogram()          # 256 ints summing to pixel count
+        total = sum(h)
+        return [v / total for v in h]
+
+    hists = [hist(img) for img in imgs]
+    return [
+        sum(abs(a - b) for a, b in zip(hists[i], hists[i + 1])) / 2.0
+        for i in range(len(hists) - 1)
+    ]
+
+
+def _deltas_pixel(imgs):
+    """
+    Epoch-to-epoch mean absolute pixel difference, normalised to 0-1.
+
+    Resizes all images to match the first, converts to greyscale, then
+    computes the average per-pixel absolute difference. The raw value
+    is in [0, 255], so we divide by 255.
+    """
+    base_size = imgs[0].size
+
+    def to_pixels(img):
+        if img.size != base_size:
+            img = img.resize(base_size, Image.LANCZOS)
+        grey = img.convert("L")
+        return list(grey.getdata())
+
+    pixel_lists = [to_pixels(img) for img in imgs]
+    return [
+        sum(
+            abs(a - b)
+            for a, b in zip(pixel_lists[i], pixel_lists[i + 1])
+        ) / (255.0 * len(pixel_lists[i]))
+        for i in range(len(pixel_lists) - 1)
+    ]
+
+
+_METRIC_FNS = {
+    "phash": _deltas_phash,
+    "histogram": _deltas_histogram,
+    "pixel": _deltas_pixel,
+}
+
+_SERIES_STYLES = {
+    # (line colour, dot colour, legend label)
+    "phash":     ((100, 180, 255), (255, 220,  80), "pHash"),
+    "histogram": ((120, 220, 120), (255, 140,  60), "Histogram"),
+    "pixel":     ((220, 120, 180), (180, 255, 180), "Pixel diff"),
+}
+
+
+# ---------------------------------------------------------------------------
 # Similarity graph
 # ---------------------------------------------------------------------------
 
@@ -436,13 +517,12 @@ def _epoch_label(full_label):
     return "final"
 
 
-def build_similarity_graph(images_and_labels, out_path):
+def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
     """
-    Build and save a line graph of epoch-to-epoch perceptual hash distance.
+    Build and save a line graph of epoch-to-epoch image similarity.
 
-    Hashes each image with pHash and plots the Hamming distance between
-    each consecutive pair. A distance of 0 means identical; 64 is the
-    maximum for a 64-bit pHash.
+    *methods* is a tuple of method names from METHODS. All selected
+    series are plotted on the same normalised 0-1 y-axis with a legend.
     """
     if len(images_and_labels) < 2:
         print("  Skipping similarity graph: need at least 2 images.")
@@ -450,32 +530,24 @@ def build_similarity_graph(images_and_labels, out_path):
 
     imgs, labels = zip(*images_and_labels)
 
-    # Compute pHash for every image
-    hashes = [imagehash.phash(img) for img in imgs]
-
-    # Delta distance between each consecutive pair
-    deltas = [
-        hashes[i] - hashes[i + 1]
-        for i in range(len(hashes) - 1)
-    ]
-
-    # Short labels for every epoch; the x-axis label for delta i shows
-    # the left epoch of each pair, e.g. "8" for the 8->9 transition.
-    # If the last epoch is unlabeled ("final"), we override the rightmost
-    # label with the inferred next number (max numbered epoch + 1) so
-    # the final epoch shows up on the x-axis aligned with its data point.
+    # Short labels for x-axis. Each label is the right-hand epoch of
+    # each consecutive pair, so the last label is always the final epoch.
     short_labels = [_epoch_label(lbl) for lbl in labels]
-    x_labels = short_labels[:-1]
-    if x_labels and short_labels and short_labels[-1] == "final":
-        numbered = [int(s) for s in short_labels if s.isdigit()]
-        if numbered:
-            x_labels[-1] = str(max(numbered) + 1)
+    x_labels = short_labels[1:]
 
-    # --- Layout constants ---
-    width = max(800, 120 * len(deltas))
+    n_deltas = len(imgs) - 1
+
+    # Compute deltas for each requested method
+    series = {}
+    for method in methods:
+        print(f"  Computing {method} similarity…")
+        series[method] = _METRIC_FNS[method](list(imgs))
+
+    # --- Layout ---
+    width = max(800, 120 * n_deltas)
     height = 500
-    pad_left = 80
-    pad_right = 40
+    pad_left = 70
+    pad_right = 120   # extra room for legend
     pad_top = 40
     pad_bottom = 60
 
@@ -488,55 +560,64 @@ def build_similarity_graph(images_and_labels, out_path):
     font_small = _get_font(max(14, height // 30))
     font_label = _get_font(max(12, height // 36))
 
-    # Y axis: fixed 0-64 range (full pHash range) for consistency
-    y_max = 64
+    # Y axis: normalised 0-1
+    y_max = 1.0
 
     def to_xy(idx, val):
-        """Convert a (delta_index, distance) pair to pixel coords."""
-        if len(deltas) > 1:
-            x = pad_left + int(idx * plot_w / (len(deltas) - 1))
+        """Convert a (delta_index, normalised_value) pair to pixels."""
+        if n_deltas > 1:
+            x = pad_left + int(idx * plot_w / (n_deltas - 1))
         else:
             x = pad_left + plot_w // 2
         y = pad_top + plot_h - int(val / y_max * plot_h)
         return x, y
 
-    # Grid lines at 0, 16, 32, 48, 64
-    for grid_val in range(0, y_max + 1, 16):
-        gx0 = pad_left
-        gx1 = pad_left + plot_w
+    # Grid lines at 0, 0.25, 0.5, 0.75, 1.0
+    for grid_val in [0.0, 0.25, 0.5, 0.75, 1.0]:
         gy = pad_top + plot_h - int(grid_val / y_max * plot_h)
-        draw.line([(gx0, gy), (gx1, gy)], fill=(70, 70, 70), width=1)
+        draw.line(
+            [(pad_left, gy), (pad_left + plot_w, gy)],
+            fill=(70, 70, 70), width=1,
+        )
         draw.text(
-            (pad_left - 8, gy),
-            str(grid_val),
+            (pad_left - 6, gy),
+            f"{grid_val:.2f}",
             fill=(160, 160, 160),
             font=font_label,
             anchor="rm",
         )
 
-    # Plot line and points
-    points = [to_xy(i, d) for i, d in enumerate(deltas)]
-
-    for i in range(len(points) - 1):
-        draw.line([points[i], points[i + 1]], fill=(100, 180, 255), width=3)
-
+    # Plot each series
     dot_r = max(4, height // 80)
-    for i, (px, py) in enumerate(points):
-        draw.ellipse(
-            [(px - dot_r, py - dot_r), (px + dot_r, py + dot_r)],
-            fill=(255, 220, 80),
-        )
-        # Distance value above each point
-        draw.text(
-            (px, py - dot_r - 6),
-            str(deltas[i]),
-            fill=(220, 220, 220),
-            font=font_label,
-            anchor="mb",
-        )
+    for method, deltas in series.items():
+        line_col, dot_col, legend_lbl = _SERIES_STYLES[method]
+        points = [to_xy(i, d) for i, d in enumerate(deltas)]
 
-    # X-axis labels: single-line epoch numbers centred under each point
-    for i, (px, _) in enumerate(points):
+        for i in range(len(points) - 1):
+            draw.line(
+                [points[i], points[i + 1]],
+                fill=line_col, width=2,
+            )
+
+        for i, (px, py) in enumerate(points):
+            draw.ellipse(
+                [(px - dot_r, py - dot_r), (px + dot_r, py + dot_r)],
+                fill=dot_col,
+            )
+            # Only annotate values when a single method is shown to
+            # avoid cluttering multi-series graphs
+            if len(series) == 1:
+                draw.text(
+                    (px, py - dot_r - 6),
+                    f"{deltas[i]:.3f}",
+                    fill=(220, 220, 220),
+                    font=font_label,
+                    anchor="mb",
+                )
+
+    # X-axis labels
+    for i in range(n_deltas):
+        px, _ = to_xy(i, 0)
         draw.text(
             (px, pad_top + plot_h + 12),
             x_labels[i],
@@ -545,10 +626,28 @@ def build_similarity_graph(images_and_labels, out_path):
             anchor="mt",
         )
 
+    # Legend (top-right inside the pad_right margin)
+    legend_x = pad_left + plot_w + 10
+    legend_y = pad_top
+    for method in methods:
+        line_col, dot_col, legend_lbl = _SERIES_STYLES[method]
+        # Colour swatch
+        draw.rectangle(
+            [legend_x, legend_y, legend_x + 16, legend_y + 14],
+            fill=line_col,
+        )
+        draw.text(
+            (legend_x + 22, legend_y),
+            legend_lbl,
+            fill=(200, 200, 200),
+            font=font_label,
+        )
+        legend_y += 24
+
     # Chart title
     draw.text(
-        (width // 2, 12),
-        "Epoch-to-epoch pHash distance (lower = more similar)",
+        (pad_left + plot_w // 2, 12),
+        "Epoch-to-epoch similarity (higher = more change)",
         fill=(210, 210, 210),
         font=font_small,
         anchor="mt",
@@ -564,7 +663,7 @@ def build_similarity_graph(images_and_labels, out_path):
 
 def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
              overwrite_composite=False, overwrite_graph=False,
-             overwrite_json=False):
+             overwrite_json=False, methods=("phash",)):
     """Run the full evaluation pipeline for all LoRAs in *lora_dir*."""
     api_url = config["comfyui_url"]
     base_positive = config["positive_prompt"]
@@ -646,7 +745,8 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
 
         graph_path = os.path.join(lora_dir, "_similarity.png")
         if overwrite_graph or not os.path.exists(graph_path):
-            build_similarity_graph(composite_entries, graph_path)
+            build_similarity_graph(composite_entries, graph_path,
+                                   methods=methods)
             print(f"Similarity graph saved: {graph_path}")
         else:
             print(f"Skipping graph (already exists, use -og to regen)")
@@ -698,6 +798,18 @@ def parse_args():
         help="Recreate metadata JSON files even if they already exist.",
     )
     parser.add_argument(
+        "--method",
+        nargs="+",
+        choices=METHODS + ("all",),
+        default=["phash"],
+        metavar="METHOD",
+        help=(
+            "Similarity method(s) to plot: phash, histogram, pixel, all."
+            " Multiple values are plotted as separate series."
+            " (default: phash)"
+        ),
+    )
+    parser.add_argument(
         "-o", "--overwrite",
         action="store_true",
         help="Shorthand for -oi -oc -og -oj (overwrite everything).",
@@ -724,6 +836,9 @@ def main():
     # -o is shorthand for all four overwrite flags
     overwrite_all = args.overwrite
 
+    # Expand "all" to every method
+    methods = list(METHODS) if "all" in args.method else args.method
+
     evaluate(
         config, args.lora_dir,
         dry_run=args.dry_run,
@@ -731,6 +846,7 @@ def main():
         overwrite_composite=args.overwrite_composite or overwrite_all,
         overwrite_graph=args.overwrite_graph or overwrite_all,
         overwrite_json=args.overwrite_json or overwrite_all,
+        methods=tuple(methods),
     )
 
 
