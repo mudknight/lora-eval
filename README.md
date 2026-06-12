@@ -10,13 +10,9 @@ grid (one row per prompt, one column per epoch) and a similarity graph.
 ## Installation
 
 ```sh
-pip install -e .
-```
-
-Or build a standalone binary with PyInstaller:
-
-```sh
-pyinstaller lora-eval.spec
+make venv-setup
+make build
+make install
 ```
 
 ## Configuration

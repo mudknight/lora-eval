@@ -1,0 +1,15 @@
+altgraph==0.17.5
+certifi==2026.5.20
+charset-normalizer==3.4.7
+idna==3.18
+ImageHash==4.3.2
+numpy==2.4.6
+packaging==26.2
+pillow==12.2.0
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.6
+PyWavelets==1.9.0
+requests==2.34.2
+scipy==1.17.1
+setuptools==82.0.1
+urllib3==2.7.0
