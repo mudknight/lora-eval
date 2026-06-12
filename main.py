@@ -814,7 +814,7 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
             print(f"\nComposite saved: {composite_path}")
         else:
             print(
-                "\nSkipping composite (already exists, use -oc to regen)"
+                "\nSkipping composite (already exists, use -o composite to regen)"
             )
 
         graph_path = os.path.join(lora_dir, "_similarity.png")
@@ -824,7 +824,7 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
             )
             print(f"Similarity graph saved: {graph_path}")
         else:
-            print("Skipping graph (already exists, use -og to regen)")
+            print("Skipping graph (already exists, use -o graph to regen)")
 
 
 # ---------------------------------------------------------------------------
@@ -841,45 +841,32 @@ def parse_args():
         help="Directory containing .safetensors files.",
     )
     parser.add_argument(
-        "--config",
+        "-c", "--config",
         default=None,
         help="Path to the JSON config file"
              " (default: ~/.config/lora-eval/config.json).",
     )
     parser.add_argument(
-        "--workflow",
+        "-w", "--workflow",
         default=None,
         help="Path to the ComfyUI workflow JSON file"
              " (default: path from config or"
              " ~/.config/lora-eval/<filename>).",
     )
     parser.add_argument(
-        "--dry-run",
+        "-n", "--dry-run",
         action="store_true",
         help="Validate config and list LoRAs without calling the API.",
     )
     parser.add_argument(
-        "-oi", "--overwrite-images",
-        action="store_true",
-        help="Regenerate images even if they already exist.",
+        "-o", "--overwrite",
+        default="",
+        metavar="ITEMS",
+        help="Comma-separated items to regenerate: images,composite,graph,"
+             "json, or all. (default: none)",
     )
     parser.add_argument(
-        "-oc", "--overwrite-composite",
-        action="store_true",
-        help="Rebuild the composite even if it already exists.",
-    )
-    parser.add_argument(
-        "-og", "--overwrite-graph",
-        action="store_true",
-        help="Rebuild the similarity graph even if it already exists.",
-    )
-    parser.add_argument(
-        "-oj", "--overwrite-json",
-        action="store_true",
-        help="Recreate metadata JSON files even if they already exist.",
-    )
-    parser.add_argument(
-        "--method",
+        "-m", "--method",
         nargs="+",
         choices=METHODS + ("all",),
         default=["all"],
@@ -888,11 +875,6 @@ def parse_args():
             "Similarity method(s): phash, histogram, pixel, all."
             " (default: all)"
         ),
-    )
-    parser.add_argument(
-        "-o", "--overwrite",
-        action="store_true",
-        help="Shorthand for -oi -oc -og -oj (overwrite everything).",
     )
     return parser.parse_args()
 
@@ -922,16 +904,28 @@ def main():
         config["workflow_file"]
     )
 
-    overwrite_all = args.overwrite
+    if args.overwrite == "all":
+        ow = {"images": True, "composite": True, "graph": True, "json": True}
+    elif args.overwrite:
+        ow = {k: False for k in ("images", "composite", "graph", "json")}
+        for item in args.overwrite.split(","):
+            if item not in ow:
+                print(f"Error: unknown overwrite item '{item}'",
+                      file=sys.stderr)
+                sys.exit(1)
+            ow[item] = True
+    else:
+        ow = {k: False for k in ("images", "composite", "graph", "json")}
+
     methods = list(METHODS) if "all" in args.method else args.method
 
     evaluate(
         config, args.lora_dir,
         dry_run=args.dry_run,
-        overwrite_images=args.overwrite_images or overwrite_all,
-        overwrite_composite=args.overwrite_composite or overwrite_all,
-        overwrite_graph=args.overwrite_graph or overwrite_all,
-        overwrite_json=args.overwrite_json or overwrite_all,
+        overwrite_images=ow["images"],
+        overwrite_composite=ow["composite"],
+        overwrite_graph=ow["graph"],
+        overwrite_json=ow["json"],
         methods=tuple(methods),
     )
 

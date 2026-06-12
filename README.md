@@ -4,4 +4,4 @@ To-do
 - [x] Add workflow argument
 - [x] Use defaults without --config or --workflow
 - [x] Change default method to all
-- [ ] Add short flags for all arguments and use single letters to use them together
+- [x] Add short flags for all arguments and use single letters to use them together
