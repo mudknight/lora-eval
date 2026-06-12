@@ -1,5 +1,9 @@
 # lora-eval
 
+![Composite](assets/composite.png)
+
+![Similarity](assets/similarity.png)
+
 Evaluate Stable Diffusion LoRAs via the ComfyUI API.
 
 For each `.safetensors` file in the target directory, injects LoRA syntax
