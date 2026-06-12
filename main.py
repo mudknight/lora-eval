@@ -854,6 +854,11 @@ def parse_args():
              " ~/.config/lora-eval/<filename>).",
     )
     parser.add_argument(
+        "-t", "--trigger-words",
+        default=None,
+        help="Override trigger words from config.",
+    )
+    parser.add_argument(
         "-n", "--dry-run",
         action="store_true",
         help="Validate config and list LoRAs without calling the API.",
@@ -899,6 +904,8 @@ def main():
 
     if args.workflow is not None:
         config["workflow_file"] = args.workflow
+    if args.trigger_words is not None:
+        config["trigger_words"] = args.trigger_words
 
     config["workflow_file"] = _resolve_workflow_path(
         config["workflow_file"]
