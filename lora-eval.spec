@@ -4,10 +4,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('config.json', '.'),
-        ('workflow.json', '.'),
-    ],
+    datas=[],
     hiddenimports=[
         'PIL',
         'PIL._tkinter_finder',
