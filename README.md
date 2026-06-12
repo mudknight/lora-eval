@@ -44,6 +44,10 @@ config:
 }
 ```
 
+## Workflow
+
+A workflow json is required for this script to function and should be saved as `~/.config/lora-eval/workflow.json`. This should be your normal workflow exported as an api json file. I'd recommend replacing save nodes with preview nodes to avoid spamming your outputs. The positive and negative prompt text fields need to be mapped in your `config.json`.
+
 ## Usage
 
 ```sh
