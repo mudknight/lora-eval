@@ -134,6 +134,28 @@ def find_loras(directory):
     return sorted(files, key=_lora_sort_key)
 
 
+def _compute_epoch_labels(loras):
+    numbers = []
+    for path in loras:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        match = re.search(r'(\d+)$', stem)
+        numbers.append(int(match.group(1)) if match else None)
+
+    numbered = [(i, n) for i, n in enumerate(numbers) if n is not None]
+    labels = []
+    for num in numbers:
+        if num is not None:
+            labels.append(str(num))
+        elif len(numbered) >= 2:
+            step = numbered[-1][1] - numbered[-2][1]
+            labels.append(str(numbered[-1][1] + step))
+        elif len(numbered) == 1:
+            labels.append(str(numbered[0][1] + 1))
+        else:
+            labels.append("0")
+    return labels
+
+
 def lora_syntax(safetensors_path, weight, trigger_words):
     """
     Build the LoRA syntax string appended to the positive prompt.
@@ -393,7 +415,7 @@ def _truncate_label(label, font, max_width):
     return "…"
 
 
-def build_composite(rows, out_path):
+def build_composite(rows, out_path, title=""):
     """
     Build and save a multi-row composite image.
 
@@ -419,16 +441,48 @@ def build_composite(rows, out_path):
     col_header_h = int(font_size * 2.0)
     font = _get_font(font_size)
 
-    # Row label sidebar — narrower than a full image column
-    row_label_w = int(base_w * 0.28)
+    # Row label sidebar — dynamic width to fit content
     row_label_font_size = max(16, int(base_h * 0.04))
     row_label_font = _get_font(row_label_font_size)
+
+    def _text_width(f, t):
+        try:
+            bb = f.getbbox(t)
+            return bb[2] - bb[0]
+        except AttributeError:
+            return f.getlength(t)
+
+    needed = int(base_w * 0.28)
+    pad = 24
+    if title:
+        needed = max(needed, _text_width(font, title) + pad)
+    for row in rows:
+        label = getattr(row, "label", "")
+        needed = max(needed, _text_width(row_label_font, label) + pad)
+    row_label_w = needed
 
     total_w = row_label_w + base_w * n_cols
     total_h = col_header_h + base_h * n_rows
 
     composite = Image.new("RGB", (total_w, total_h), color=(30, 30, 30))
     draw = ImageDraw.Draw(composite)
+
+    # Title in the top-left corner
+    draw.rectangle(
+        [0, 0, row_label_w, col_header_h],
+        fill=(40, 40, 40),
+    )
+    try:
+        bb = font.getbbox(title)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    except AttributeError:
+        tw, th = draw.textsize(title, font=font)
+    draw.text(
+        ((row_label_w - tw) // 2, (col_header_h - th) // 2),
+        title,
+        fill=(200, 200, 200),
+        font=font,
+    )
 
     # Column headers — epoch labels from the first row
     for col_idx, (_, label) in enumerate(rows[0]):
@@ -461,7 +515,6 @@ def build_composite(rows, out_path):
         )
         # Use the prompt label stored on the row (passed as row_label)
         row_label = getattr(row, "label", "")
-        row_label = _truncate_label(row_label, row_label_font, row_label_w)
         try:
             bb = row_label_font.getbbox(row_label)
             rw, rh = bb[2] - bb[0], bb[3] - bb[1]
@@ -751,13 +804,14 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
         LabelledRow(p["label"], []) for p in prompts
     ]
 
+    epoch_labels = _compute_epoch_labels(loras)
+
     # first_prompt_entries used for the similarity graph
     first_prompt_entries = []
 
-    for lora_path in loras:
+    for lora_idx, lora_path in enumerate(loras):
         syntax = lora_syntax(lora_path, lora_weight, trigger_words)
-        stem = os.path.splitext(os.path.basename(lora_path))[0]
-        epoch_label = f"{stem} ({lora_weight})"
+        epoch_label = epoch_labels[lora_idx]
 
         print(f"\nProcessing: {os.path.basename(lora_path)}")
 
@@ -810,7 +864,10 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
     if any(composite_rows) and not dry_run:
         composite_path = os.path.join(lora_dir, "_composite.png")
         if overwrite_composite or not os.path.exists(composite_path):
-            build_composite(composite_rows, composite_path)
+            build_composite(
+                composite_rows, composite_path,
+                title=os.path.basename(os.path.normpath(lora_dir)),
+            )
             print(f"\nComposite saved: {composite_path}")
         else:
             print(
