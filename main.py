@@ -882,11 +882,11 @@ def parse_args():
         "--method",
         nargs="+",
         choices=METHODS + ("all",),
-        default=["phash"],
+        default=["all"],
         metavar="METHOD",
         help=(
             "Similarity method(s): phash, histogram, pixel, all."
-            " (default: phash)"
+            " (default: all)"
         ),
     )
     parser.add_argument(
