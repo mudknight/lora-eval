@@ -83,6 +83,28 @@ def load_workflow(workflow_path):
         return json.load(fh)
 
 
+def _xdg_config_dir():
+    return os.path.join(
+        os.environ.get("XDG_CONFIG_HOME",
+                       os.path.expanduser("~/.config")),
+        "lora-eval",
+    )
+
+
+def _resolve_config_path(given_path):
+    """Resolve config path, checking ~/.config/lora-eval/ as fallback."""
+    if given_path is not None:
+        return given_path
+    return os.path.join(_xdg_config_dir(), "config.json")
+
+
+def _resolve_workflow_path(cfg_workflow):
+    """Resolve workflow path, checking ~/.config/lora-eval/ as fallback."""
+    if os.path.isabs(cfg_workflow):
+        return cfg_workflow
+    return os.path.join(_xdg_config_dir(), cfg_workflow)
+
+
 # ---------------------------------------------------------------------------
 # LoRA discovery
 # ---------------------------------------------------------------------------
@@ -820,8 +842,9 @@ def parse_args():
     )
     parser.add_argument(
         "--config",
-        default="config.json",
-        help="Path to the JSON config file (default: config.json).",
+        default=None,
+        help="Path to the JSON config file (default: config.json or"
+             " ~/.config/lora-eval/config.json).",
     )
     parser.add_argument(
         "--dry-run",
@@ -877,11 +900,17 @@ def main():
         )
         sys.exit(1)
 
+    config_path = _resolve_config_path(args.config)
+
     try:
-        config = load_config(args.config)
+        config = load_config(config_path)
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    config["workflow_file"] = _resolve_workflow_path(
+        config["workflow_file"]
+    )
 
     overwrite_all = args.overwrite
     methods = list(METHODS) if "all" in args.method else args.method
