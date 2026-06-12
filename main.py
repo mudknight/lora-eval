@@ -843,8 +843,15 @@ def parse_args():
     parser.add_argument(
         "--config",
         default=None,
-        help="Path to the JSON config file (default: config.json or"
-             " ~/.config/lora-eval/config.json).",
+        help="Path to the JSON config file"
+             " (default: ~/.config/lora-eval/config.json).",
+    )
+    parser.add_argument(
+        "--workflow",
+        default=None,
+        help="Path to the ComfyUI workflow JSON file"
+             " (default: path from config or"
+             " ~/.config/lora-eval/<filename>).",
     )
     parser.add_argument(
         "--dry-run",
@@ -907,6 +914,9 @@ def main():
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if args.workflow is not None:
+        config["workflow_file"] = args.workflow
 
     config["workflow_file"] = _resolve_workflow_path(
         config["workflow_file"]
