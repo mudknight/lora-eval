@@ -604,7 +604,7 @@ def _deltas_pixel(imgs):
         if img.size != base_size:
             img = img.resize(base_size, Image.LANCZOS)
         grey = img.convert("L")
-        return list(grey.getdata())
+        return list(grey.get_flattened_data())
 
     pixel_lists = [to_pixels(img) for img in imgs]
     return [
