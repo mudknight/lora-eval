@@ -106,6 +106,69 @@ def _resolve_workflow_path(cfg_workflow):
 
 
 # ---------------------------------------------------------------------------
+# safetensors header parsing
+# ---------------------------------------------------------------------------
+
+def read_safetensors_trigger(path):
+    """
+    Parse the safetensors header and return the most-frequent @ tag.
+
+    The header JSON may contain a ``__metadata__`` key with a
+    ``ss_datasets`` field.  That field is a JSON-encoded list of dataset
+    dicts, each of which may have a ``tag_frequency`` sub-dict mapping
+    folder names to {tag: count} dicts.
+
+    Only tags beginning with ``@`` are considered (anima-style trigger
+    words).  The one with the highest total count across all
+    datasets/folders is returned.  Returns an empty string if no
+    ``@``-prefixed tag is found or if the header cannot be parsed.
+    """
+    try:
+        with open(path, "rb") as fh:
+            # Header length is stored as a little-endian 64-bit uint.
+            raw_len = fh.read(8)
+            if len(raw_len) < 8:
+                return ""
+            header_len = int.from_bytes(raw_len, "little")
+            header_bytes = fh.read(header_len)
+    except OSError:
+        return ""
+
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+
+    metadata = header.get("__metadata__", {})
+    ss_datasets_raw = metadata.get("ss_datasets", "")
+    if not ss_datasets_raw:
+        return ""
+
+    try:
+        datasets = json.loads(ss_datasets_raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    # Accumulate tag counts across all datasets and folders.
+    totals = {}
+    for dataset in datasets:
+        tag_freq = dataset.get("tag_frequency", {})
+        for folder_tags in tag_freq.values():
+            for tag, count in folder_tags.items():
+                totals[tag] = totals.get(tag, 0) + count
+
+    if not totals:
+        return ""
+
+    # Only consider tags that start with '@' (anima-style trigger words).
+    at_tags = {t: c for t, c in totals.items() if t.startswith("@")}
+    if not at_tags:
+        return ""
+
+    return max(at_tags, key=at_tags.__getitem__)
+
+
+# ---------------------------------------------------------------------------
 # LoRA discovery
 # ---------------------------------------------------------------------------
 
@@ -166,7 +229,7 @@ def lora_syntax(safetensors_path, weight, trigger_words):
     """
     stem = os.path.splitext(os.path.basename(safetensors_path))[0]
     tag = f"<lora:{stem}:{weight}>"
-    if trigger_words:
+    if trigger_words:  # treats None and "" identically
         return f"{trigger_words}, {tag}"
     return tag
 
@@ -780,13 +843,15 @@ def build_similarity_graph(images_and_labels, out_path, methods=("phash",)):
 
 def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
              overwrite_composite=False, overwrite_graph=False,
-             overwrite_json=False, methods=("phash",)):
+             overwrite_json=False, methods=("phash",),
+             auto_trigger=False):
     """Run the full evaluation pipeline for all LoRAs in *lora_dir*."""
     api_url = config["comfyui_url"]
     prompts = config["prompts"]
     global_negative = config.get("negative_prompt", "")
     lora_weight = config.get("lora_weight", 1.0)
-    trigger_words = config.get("trigger_words", "")
+    # Config trigger words are only used when auto_trigger is off.
+    base_trigger_words = config.get("trigger_words", "")
 
     workflow_path = config["workflow_file"]
     workflow = load_workflow(workflow_path)
@@ -810,6 +875,23 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
     first_prompt_entries = []
 
     for lora_idx, lora_path in enumerate(loras):
+        if auto_trigger:
+            # Parse the trigger word directly from this LoRA's header.
+            trigger_words = read_safetensors_trigger(lora_path)
+            if trigger_words:
+                print(
+                    f"  Auto-trigger: '{trigger_words}'"
+                    f" (from header of"
+                    f" {os.path.basename(lora_path)})"
+                )
+            else:
+                print(
+                    "  Auto-trigger: no @-prefixed tag found in header,"
+                    " continuing without trigger word."
+                )
+        else:
+            trigger_words = base_trigger_words
+
         syntax = lora_syntax(lora_path, lora_weight, trigger_words)
         epoch_label = epoch_labels[lora_idx]
 
@@ -871,7 +953,8 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
             print(f"\nComposite saved: {composite_path}")
         else:
             print(
-                "\nSkipping composite (already exists, use -o composite to regen)"
+                "\nSkipping composite"
+                " (already exists, use -o composite to regen)"
             )
 
         graph_path = os.path.join(lora_dir, "_similarity.png")
@@ -909,6 +992,14 @@ def parse_args():
         help="Path to the ComfyUI workflow JSON file"
              " (default: path from config or"
              " ~/.config/lora-eval/<filename>).",
+    )
+    parser.add_argument(
+        "-a", "--auto-trigger",
+        action="store_true",
+        help="Parse the trigger word from each LoRA's safetensors header"
+             " (uses the most-frequent @-prefixed tag in ss_datasets;"
+             " silently skips LoRAs with no @ tag)."
+             " Overrides --trigger-words and the config value.",
     )
     parser.add_argument(
         "-t", "--trigger-words",
@@ -961,7 +1052,10 @@ def main():
 
     if args.workflow is not None:
         config["workflow_file"] = args.workflow
-    if args.trigger_words is not None:
+    # --auto-trigger takes priority; skip the config/CLI trigger words.
+    if args.auto_trigger:
+        config["trigger_words"] = ""
+    elif args.trigger_words is not None:
         config["trigger_words"] = args.trigger_words
 
     config["workflow_file"] = _resolve_workflow_path(
@@ -991,6 +1085,7 @@ def main():
         overwrite_graph=ow["graph"],
         overwrite_json=ow["json"],
         methods=tuple(methods),
+        auto_trigger=args.auto_trigger,
     )
 
 
