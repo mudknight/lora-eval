@@ -994,6 +994,13 @@ def parse_args():
              " ~/.config/lora-eval/<filename>).",
     )
     parser.add_argument(
+        "-p", "--preset",
+        default=None,
+        metavar="NAME",
+        help="Use a named prompt preset from 'prompt_presets' in the"
+             " config, overriding the default 'prompts' list.",
+    )
+    parser.add_argument(
         "-a", "--auto-trigger",
         action="store_true",
         help="Parse the trigger word from each LoRA's safetensors header"
@@ -1049,6 +1056,18 @@ def main():
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if args.preset is not None:
+        presets = config.get("prompt_presets", {})
+        if args.preset not in presets:
+            available = ", ".join(presets) if presets else "(none defined)"
+            print(
+                f"Error: preset '{args.preset}' not found in config."
+                f" Available: {available}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        config["prompts"] = presets[args.preset]
 
     if args.workflow is not None:
         config["workflow_file"] = args.workflow
