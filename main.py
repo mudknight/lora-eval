@@ -377,7 +377,7 @@ def sha256_of_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
-def write_metadata(lora_path, image_path, overwrite=False):
+def write_metadata(lora_path, image_path, trigger_words="", overwrite=False):
     """
     Create or update the LoRA Manager metadata JSON for *lora_path*.
 
@@ -394,6 +394,8 @@ def write_metadata(lora_path, image_path, overwrite=False):
         with open(meta_path, "r", encoding="utf-8") as fh:
             meta = json.load(fh)
         meta["preview_url"] = image_path
+        if trigger_words:
+            meta.setdefault("civitai", {})["trainedWords"] = [trigger_words]
         print(f"  Updated metadata: {os.path.basename(meta_path)}")
     else:
         stat = os.stat(lora_path)
@@ -413,7 +415,7 @@ def write_metadata(lora_path, image_path, overwrite=False):
             "preview_nsfw_level": 0,
             "notes": "",
             "from_civitai": True,
-            "civitai": {},
+            "civitai": {"trainedWords": [trigger_words]} if trigger_words else {},
             "tags": [],
             "modelDescription": "",
             "civitai_deleted": False,
@@ -934,7 +936,9 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
             # Write metadata pointing at the first prompt's image only
             if p_idx == 0:
                 write_metadata(
-                    lora_path, dest, overwrite=overwrite_json
+                    lora_path, dest,
+                    trigger_words=trigger_words,
+                    overwrite=overwrite_json,
                 )
 
             composite_rows[p_idx].append((img, epoch_label))
