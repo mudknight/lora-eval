@@ -109,45 +109,55 @@ def _resolve_workflow_path(cfg_workflow):
 # safetensors header parsing
 # ---------------------------------------------------------------------------
 
-def read_safetensors_trigger(path):
+def read_safetensors_metadata(path):
     """
-    Parse the safetensors header and return the most-frequent @ tag.
+    Parse a safetensors header and return selected training metadata.
 
-    The header JSON may contain a ``__metadata__`` key with a
-    ``ss_datasets`` field.  That field is a JSON-encoded list of dataset
-    dicts, each of which may have a ``tag_frequency`` sub-dict mapping
-    folder names to {tag: count} dicts.
+    Returns a dict with keys:
+      ``trigger``  -- most-frequent @-prefixed tag, or "" if none found
+      ``name``     -- ss_output_name value, or "" if absent
+      ``epoch``    -- ss_epoch as an int, or None if absent/unparseable
 
-    Only tags beginning with ``@`` are considered (anima-style trigger
-    words).  The one with the highest total count across all
-    datasets/folders is returned.  Returns an empty string if no
-    ``@``-prefixed tag is found or if the header cannot be parsed.
+    All values fall back gracefully if the header cannot be read or the
+    relevant fields are missing.
     """
+    result = {"trigger": "", "name": "", "epoch": None}
+
     try:
         with open(path, "rb") as fh:
-            # Header length is stored as a little-endian 64-bit uint.
+            # Header length is a little-endian 64-bit uint.
             raw_len = fh.read(8)
             if len(raw_len) < 8:
-                return ""
+                return result
             header_len = int.from_bytes(raw_len, "little")
             header_bytes = fh.read(header_len)
     except OSError:
-        return ""
+        return result
 
     try:
         header = json.loads(header_bytes.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return ""
+        return result
 
     metadata = header.get("__metadata__", {})
+
+    result["name"] = metadata.get("ss_output_name", "")
+
+    raw_epoch = metadata.get("ss_epoch")
+    if raw_epoch is not None:
+        try:
+            result["epoch"] = int(raw_epoch)
+        except (ValueError, TypeError):
+            pass
+
     ss_datasets_raw = metadata.get("ss_datasets", "")
     if not ss_datasets_raw:
-        return ""
+        return result
 
     try:
         datasets = json.loads(ss_datasets_raw)
     except (json.JSONDecodeError, TypeError):
-        return ""
+        return result
 
     # Accumulate tag counts across all datasets and folders.
     totals = {}
@@ -157,15 +167,12 @@ def read_safetensors_trigger(path):
             for tag, count in folder_tags.items():
                 totals[tag] = totals.get(tag, 0) + count
 
-    if not totals:
-        return ""
-
-    # Only consider tags that start with '@' (anima-style trigger words).
+    # Only @-prefixed tags are anima-style trigger words.
     at_tags = {t: c for t, c in totals.items() if t.startswith("@")}
-    if not at_tags:
-        return ""
+    if at_tags:
+        result["trigger"] = max(at_tags, key=at_tags.__getitem__)
 
-    return max(at_tags, key=at_tags.__getitem__)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +422,10 @@ def write_metadata(lora_path, image_path, trigger_words="", overwrite=False):
             "preview_nsfw_level": 0,
             "notes": "",
             "from_civitai": True,
-            "civitai": {"trainedWords": [trigger_words]} if trigger_words else {},
+            "civitai": (
+                {"trainedWords": [trigger_words]}
+                if trigger_words else {}
+            ),
             "tags": [],
             "modelDescription": "",
             "civitai_deleted": False,
@@ -875,11 +885,24 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
 
     # first_prompt_entries used for the similarity graph
     first_prompt_entries = []
+    # composite title: use ss_output_name from first LoRA if available
+    composite_title = os.path.basename(os.path.normpath(lora_dir))
 
     for lora_idx, lora_path in enumerate(loras):
+        # Always parse the header; fields not needed fall back silently.
+        lora_meta = read_safetensors_metadata(lora_path)
+
+        if lora_meta["name"] and lora_idx == 0:
+            composite_title = lora_meta["name"]
+
+        # Prefer header epoch over filename-parsed label.
+        if lora_meta["epoch"] is not None:
+            epoch_label = str(lora_meta["epoch"])
+        else:
+            epoch_label = epoch_labels[lora_idx]
+
         if auto_trigger:
-            # Parse the trigger word directly from this LoRA's header.
-            trigger_words = read_safetensors_trigger(lora_path)
+            trigger_words = lora_meta["trigger"]
             if trigger_words:
                 print(
                     f"  Auto-trigger: '{trigger_words}'"
@@ -895,7 +918,6 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
             trigger_words = base_trigger_words
 
         syntax = lora_syntax(lora_path, lora_weight, trigger_words)
-        epoch_label = epoch_labels[lora_idx]
 
         print(f"\nProcessing: {os.path.basename(lora_path)}")
 
@@ -952,7 +974,7 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
         if overwrite_composite or not os.path.exists(composite_path):
             build_composite(
                 composite_rows, composite_path,
-                title=os.path.basename(os.path.normpath(lora_dir)),
+                title=composite_title,
             )
             print(f"\nComposite saved: {composite_path}")
         else:
@@ -1007,10 +1029,10 @@ def parse_args():
     parser.add_argument(
         "-a", "--auto-trigger",
         action="store_true",
-        help="Parse the trigger word from each LoRA's safetensors header"
-             " (uses the most-frequent @-prefixed tag in ss_datasets;"
-             " silently skips LoRAs with no @ tag)."
-             " Overrides --trigger-words and the config value.",
+        help="Append the most-frequent @-prefixed tag from each LoRA's"
+             " safetensors header to the prompt. Silently skips LoRAs"
+             " with no @ tag. Overrides --trigger-words and the config"
+             " value. The header is always read for name and epoch.",
     )
     parser.add_argument(
         "-t", "--trigger-words",
