@@ -230,11 +230,19 @@ def lora_syntax(safetensors_path, weight, trigger_words):
     """
     Build the LoRA syntax string appended to the positive prompt.
 
-    Uses only the filename stem (no directory, no extension), as
-    ComfyUI expects the name relative to the models/loras folder.
+    Derives the name by resolving the path to absolute and splitting
+    at the first occurrence of *models/loras/*.  If that marker is
+    not present, falls back to the bare filename stem.
     Format: <lora:NAME:WEIGHT>
     """
-    stem = os.path.splitext(os.path.basename(safetensors_path))[0]
+    abs_path = os.path.abspath(safetensors_path)
+    marker = "models/loras/"
+    idx = abs_path.find(marker)
+    if idx != -1:
+        relative = abs_path[idx + len(marker):]
+        stem = os.path.splitext(relative)[0]
+    else:
+        stem = os.path.splitext(os.path.basename(abs_path))[0]
     tag = f"<lora:{stem}:{weight}>"
     if trigger_words:  # treats None and "" identically
         return f"{trigger_words}, {tag}"
@@ -867,6 +875,8 @@ def evaluate(config, lora_dir, dry_run=False, overwrite_images=False,
 
     workflow_path = config["workflow_file"]
     workflow = load_workflow(workflow_path)
+
+    lora_dir = os.path.abspath(lora_dir)
 
     loras = find_loras(lora_dir)
     if not loras:
